@@ -34,7 +34,7 @@ from futscml.stopwatch import Stopwatch
 from futscml.util import HWC3
 from futscml.models import SmoothUpsampleLayer
 from futscml.sds import SDSControlNet
-from futscml.futscml import GramMatrix
+from futscml.futscml import GramMatrix, guess_model_device, pil_to_np
 
 
 class ImageToImageGenerator_JohnsonFutschik(nn.Module):
@@ -175,16 +175,6 @@ class ImageLoss(nn.Module):
         return self.objective(x, y)
 
 
-def rand_ind_2d(h, w, numind, device, unique=False):
-    if not unique:
-        hc = torch.randint(low=0, high=h, size=(numind,), device=device)
-        wc = torch.randint(low=0, high=w, size=(numind,), device=device)
-    else:
-        hc = (torch.randperm(h * w, device=device) // w)[:numind]
-        wc = (torch.randperm(h * w, device=device) // h)[:numind]
-    return hc, wc
-
-
 class Vgg19_Extractor(nn.Module):
     def __init__(self, capture_layers):
         super().__init__()
@@ -232,7 +222,7 @@ class InnerProductLoss(nn.Module):
         res = self.vgg(x)
         return res
 
-    def run_scale(self, frame_y, pure_y, frame_x, pure_x, cache_y2: bool = True, scale: float = 1.):
+    def run_scale(self, frame_y, pure_y, cache_y2: bool = True, scale: float = 1.):
         frame_y = F.interpolate(frame_y, scale_factor=float(scale), mode='bilinear', align_corners=False,
                                 recompute_scale_factor=False)
         feat_frame_y = self.extractor(frame_y)
@@ -246,7 +236,6 @@ class InnerProductLoss(nn.Module):
             feat_pure_y = self.extractor(pure_y)
             gmm_pure_y = [self.gmm(l) for idx, l in enumerate(feat_pure_y)]
 
-        # loss : List[torch.Tensor] = []
         loss = torch.empty((len(feat_frame_y),)).to(frame_y.device)
         for l in range(len(feat_frame_y)):
             gmm_frame_y = self.gmm(feat_frame_y[l])
@@ -256,8 +245,8 @@ class InnerProductLoss(nn.Module):
             loss[l] = dist
         return torch.sum(loss)
 
-    def forward(self, frame_y, pure_y, frame_x, pure_x, cache_y2: bool = True):
-        scale_1_loss = self.run_scale(frame_y, pure_y, frame_x, pure_x, cache_y2, scale=1.0)
+    def forward(self, frame_y, pure_y, cache_y2: bool = True):
+        scale_1_loss = self.run_scale(frame_y, pure_y, cache_y2, scale=1.0)
         # scale_2_loss = self.run_scale(y1, y2, cache_y2, scale=0.5)
         return scale_1_loss
 
@@ -478,7 +467,7 @@ def cut_patches(images):
 
 
 import bisect
-from typing import TypeVar, Optional, Dict
+from typing import TypeVar, Optional, Dict, List
 
 V = TypeVar("V")
 
@@ -593,8 +582,7 @@ def train_with_similarity(config, model, iters, key_weight, style_weight, struct
                     frame_y = model(frame_x.clone())
 
                 with suppress():
-                    style_loss = style_weight * similarity_loss(frame_y, pure_y, frame_x, pure_x,
-                                                                cache_y2=True)
+                    style_loss = style_weight * similarity_loss(frame_y, pure_y, cache_y2=True)
                     structure_loss = structure_weight * guidance_sd.train_step(frame_y / 2.0 + 0.5,
                                                                                control_image_0_1,
                                                                                epoch=epoch,

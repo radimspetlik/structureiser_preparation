@@ -14,8 +14,8 @@ prompt: ''
 negative_prompt: ''
 inference_step: 26
 
-log_image_update_every: 100
-log_video_update_every: 100
+log_image_update_every: 1000
+log_video_update_every: 1000
 
 resize: 512
 
