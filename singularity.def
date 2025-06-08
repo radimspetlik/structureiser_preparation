@@ -8,7 +8,7 @@ From:python:3.11-slim
     ./run.sh
 
 %files
-    /home/spetlrad/STALP/Pipfile /opt/proj/Pipfile
+    /home/spetlrad/structureiser/Pipfile /opt/proj/Pipfile
 
 %post
     apt-get -y update && apt-get install -y imagemagick ffmpeg git

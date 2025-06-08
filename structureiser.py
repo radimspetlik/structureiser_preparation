@@ -8,20 +8,33 @@ import torch
 import torch as th
 import torch.nn as nn
 import torch.optim as opt
+import torch.nn.functional as F
 import torchvision.models as models
 import torchvision.io
 import numpy as np
 import cv2
-from torchvision.models import VGG19_Weights, VGG19_BN_Weights
-from omegaconf import OmegaConf
-from torch.utils.data import DataLoader
-from torch.utils.data import Dataset
+from torch.utils.data import DataLoader, Dataset
 from torchvision.transforms import functional as Tfunc
+from torchvision.models import VGG19_Weights, VGG19_BN_Weights
 from tqdm import tqdm
+from omegaconf import OmegaConf
 from einops import repeat, rearrange
+from controlnet_aux import LineartDetector
 
-from vgg_adapter import ResidualConvLayer, Transformer2DWrapper
+from futscml import (
+    pil_loader,
+    images_in_directory,
+    tensor_resample,
+    ImageTensorConverter,
+    InfiniteDatasetSampler,
+    ValueAnnealing,
+    TensorboardLogger,
+)
+from futscml.stopwatch import Stopwatch
+from futscml.util import HWC3
+from futscml.models import SmoothUpsampleLayer
 from futscml.sds import SDSControlNet
+from futscml.futscml import GramMatrix
 
 
 class ImageToImageGenerator_JohnsonFutschik(nn.Module):
@@ -52,13 +65,11 @@ class ImageToImageGenerator_JohnsonFutschik(nn.Module):
         self.conv1 = self.relu_layer(in_filters=filters[0], out_filters=filters[1],
                                      size=3, stride=2, padding=1, bias=self.use_bias,
                                      norm_layer=self.norm_layer, nonlinearity=nn.LeakyReLU(.2),
-                                     blur_pool=self.blur_pool,
                                      conv_padding_mode=self.conv_padding_mode)
 
         self.conv2 = self.relu_layer(in_filters=filters[1], out_filters=filters[2],
                                      size=3, stride=2, padding=1, bias=self.use_bias,
                                      norm_layer=self.norm_layer, nonlinearity=nn.LeakyReLU(.2),
-                                     blur_pool=self.blur_pool,
                                      conv_padding_mode=self.conv_padding_mode)
 
         self.resnets = nn.ModuleList()
@@ -119,19 +130,11 @@ class ImageToImageGenerator_JohnsonFutschik(nn.Module):
         return output
 
     def relu_layer(self, in_filters, out_filters, size, stride, padding, bias,
-                   norm_layer, nonlinearity, blur_pool=False, conv_padding_mode='replicate'):
+                   norm_layer, nonlinearity, conv_padding_mode='replicate'):
         out = []
-        if blur_pool:
-            assert size in [3, 5]
-            assert stride > 1
-            out.append(nn.Conv2d(in_channels=in_filters, out_channels=out_filters,
-                                 kernel_size=size, stride=1, padding=padding, bias=bias,
-                                 padding_mode=conv_padding_mode))
-            out.append(BlurPool2d(channels=out_filters, kernel_size=size, stride=stride))
-        else:
-            out.append(nn.Conv2d(in_channels=in_filters, out_channels=out_filters,
-                                 kernel_size=size, stride=stride, padding=padding, bias=bias,
-                                 padding_mode=conv_padding_mode))
+        out.append(nn.Conv2d(in_channels=in_filters, out_channels=out_filters,
+                             kernel_size=size, stride=stride, padding=padding, bias=bias,
+                             padding_mode=conv_padding_mode))
         if norm_layer:
             out.append(norm_layer(num_features=out_filters))
         if nonlinearity:
@@ -432,28 +435,6 @@ class ControlProcessor:
                                              return_pil=False)
         return th.tensor(rearrange(control_image_0_255, 'h w c -> 1 c h w'), device=frame_x_0_255.device)
 
-    def differentiable_control(self, stem, frame_x_0_255):
-        control_image_0_255 = self.processor(frame_x_0_255, stem=None, return_pil=False)
-        return control_image_0_255
-
-    def warped_control(self, key_stem, flow_key, frame_x_0_255, keyframe_x_m1p1, keyframe_y_m1p1):
-        frame_oflow_path = os.path.join(self.config['oflow_dir'], f'{flow_key}.flowouX16.pkl')
-
-        oflow, occlusions, uncertainty = read_flowou_X16(frame_oflow_path)
-        oflow_t = torch.tensor(oflow).to(keyframe_y_m1p1.device)
-        occlusions_t = rearrange(torch.tensor(occlusions).to(keyframe_y_m1p1.device) * 255, 'c h w -> h w c')
-
-        control_image_0_255 = self.direct_control(key_stem, keyframe_y_m1p1[0] * 127.5 + 127.5)
-        warped_control_image_0_255, warped_keyframe_mask_t_0_255 = warp(oflow_t, occlusions_t,
-                                                                        rearrange(control_image_0_255,
-                                                                                  '1 c h w -> h w c'))
-
-        warped_control_image_0_255 = (warped_keyframe_mask_t_0_255 / 255.0) * warped_control_image_0_255
-
-        # cv2.imwrite(f'{flow_key}.png', warped_control_image_0_255.cpu().numpy().astype(np.uint8))
-
-        return rearrange(warped_control_image_0_255, 'h w c -> 1 c h w').to(keyframe_y_m1p1.device)
-
     def __call__(self, key_stems, stems, frame_x_m1p1, keyframe_x_m1p1, keyframe_y_m1p1):
         frame_x_0_255 = frame_x_m1p1 * 127.5 + 127.5
         control_images_0_255 = []
@@ -549,19 +530,17 @@ def closest_value(d: Dict[int, V], x: int, width: int) -> Optional[V]:
 def train_with_similarity(config, model, iters, key_weight, style_weight, structure_weight, dataset_train, dataset_aux,
                           dataset_val, transform, device, log):
     model.to(device)
-    reconstruction_model.to(device)
 
     if key_weight > 0.:
         image_loss = ImageLoss()
 
     params_to_optimize = list(model.parameters())
-    params_to_optimize += list(reconstruction_model.parameters())
 
     optimizer = opt.AdamW(params_to_optimize, lr=3e-5)  # RMSprop works at 2e-4
     aux_sample = InfiniteDatasetSampler(dataset_aux)
     ebest = float('inf')
 
-    log_image_update_every = 5000
+    log_image_update_every = config['log_image_update_every'] if 'log_image_update_every' in config else 5000
     log_video_update_every = config['log_video_update_every'] if 'log_video_update_every' in config else 5000
 
     stopwatch = Stopwatch()
@@ -588,18 +567,16 @@ def train_with_similarity(config, model, iters, key_weight, style_weight, struct
 
         with suppress():
             for batch_idx, batch in enumerate(dataset_train):
-                error, style_loss, key_loss, structure_loss = 0, 0, 0, 0, 0, 0
+                error, style_loss, key_loss, structure_loss = 0, 0, 0, 0
                 key_stems, *batch = batch
                 batch = [thing.to(device) for thing in batch]
                 keyframe_x, keyframe_y, pure_x, pure_y = batch
 
-
                 _, aux_batch = aux_sample()
                 stems, frame_x = aux_batch
 
-                if config['lambda_sd'] > 0. or config.get('cdiff_weight', 0.) > 0.:
-                    control_image_0_1 = control_processor(key_stems, stems, frame_x, keyframe_x, keyframe_y)
-                    control_image_0_1 = control_image_0_1.to(device)
+                control_image_0_1 = control_processor(key_stems, stems, frame_x, keyframe_x, keyframe_y)
+                control_image_0_1 = control_image_0_1.to(device)
 
                 frame_x = frame_x.to(device)
 
@@ -618,10 +595,10 @@ def train_with_similarity(config, model, iters, key_weight, style_weight, struct
                 with suppress():
                     style_loss = style_weight * similarity_loss(frame_y, pure_y, frame_x, pure_x,
                                                                 cache_y2=True)
-                    structure_loss = config['lambda_sd'] * guidance_sd.train_step(frame_y / 2.0 + 0.5,
-                                                                            control_image_0_1,
-                                                                            epoch=epoch,
-                                                                            inference_step=config['inference_step'])
+                    structure_loss = structure_weight * guidance_sd.train_step(frame_y / 2.0 + 0.5,
+                                                                               control_image_0_1,
+                                                                               epoch=epoch,
+                                                                               inference_step=config['inference_step'])
 
                 # Track values for logging
                 error = style_loss + structure_loss + key_loss
@@ -692,29 +669,6 @@ class CachedControlProcessor:
         return self.cache[stem]
 
 
-class CannyProcessor(CachedControlProcessor):
-    def __init__(self, low_threshold=100, high_threshold=200):
-        super().__init__()
-        self.low_threshold = low_threshold
-        self.high_threshold = high_threshold
-
-    def call(self, frame, *_, **__):
-        canny = cv2.Canny(frame, self.low_threshold, self.high_threshold)
-        return np.concatenate([canny[..., None], canny[..., None], canny[..., None]], axis=-1)
-
-
-class DepthProcessor(CachedControlProcessor):
-    def __init__(self):
-        super().__init__()
-        from transformers import pipeline
-        self.depth_estimator = pipeline('depth-estimation')
-
-    def call(self, input_image, *_, **__):
-        image = self.depth_estimator(Image.fromarray(input_image))['depth']
-        image = np.array(image)
-        return np.concatenate([image[..., None], image[..., None], image[..., None]], axis=-1)
-
-
 class CacheControlProcessor(CachedControlProcessor):
     def __init__(self, processor):
         super().__init__()
@@ -732,18 +686,6 @@ def prepare_cldm(config):
     if config['cldm_type'] == 'lineart':
         guidance_sd = SDSControlNet(device, fp16=False)
         processor = CacheControlProcessor(LineartDetector.from_pretrained("lllyasviel/Annotators"))
-    elif config['cldm_type'] == 'difflineart':
-        guidance_sd = SDSControlNet(device, fp16=False)
-        processor = CacheControlProcessor(DifferentiableLineArt.from_pretrained("lllyasviel/Annotators"))
-    elif config['cldm_type'] == 'canny':
-        guidance_sd = SDSControlNet(device, fp16=False, checkpoint='lllyasviel/control_v11p_sd15_canny')
-        processor = CannyProcessor()
-    elif config['cldm_type'] == 'softedge':
-        guidance_sd = SDSControlNet(device, fp16=False, checkpoint='lllyasviel/control_v11p_sd15_softedge')
-        processor = CacheControlProcessor(PidiNetDetector.from_pretrained('lllyasviel/Annotators'))
-    elif config['cldm_type'] == 'depth':
-        guidance_sd = SDSControlNet(device, fp16=False, checkpoint='lllyasviel/control_v11f1p_sd15_depth')
-        processor = DepthProcessor()
     else:
         raise ValueError(f"Unknown CLDM type {config['cldm_type']}")
     guidance_sd.get_text_embeds([config['prompt'] if config['prompt'] is not None else ""],
@@ -779,209 +721,6 @@ class ModelMock:
 
     def zero_grad(self):
         pass
-
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-
-# --------------------
-# Patchify and Unpatchify
-# --------------------
-class Patchify(nn.Module):
-    """
-    Splits an image of shape (B, C, H, W) into a tensor of patches (B, N, C, p, p),
-    where p=patch_size, N=(H/p)*(W/p).
-    Uses nn.Unfold internally.
-    """
-
-    def __init__(self, patch_size=16):
-        super().__init__()
-        self.patch_size = patch_size
-
-    def forward(self, x):
-        """
-        x: (B, C, H, W)
-        return: patches of shape (B, N, C, p, p)
-        """
-        B, C, H, W = x.shape
-        p = self.patch_size
-
-        # Extract patches using unfold:
-        #   unfold => (B, C * p^2, N) where N = number of patches = (H/p)*(W/p)
-        patches = F.unfold(x, kernel_size=p, stride=p)  # (B, C*p*p, N)
-
-        # Rearrange to (B, N, C, p, p)
-        patches = patches.transpose(1, 2)  # (B, N, C*p*p)
-        patches = patches.view(B, -1, C, p, p)  # (B, N, C, p, p)
-
-        return patches
-
-
-class Unpatchify(nn.Module):
-    """
-    Reconstructs (folds) patches of shape (B, N, C, p, p) back into a full image (B, C, H, W).
-    Uses nn.Fold internally. You need to specify the original image size or store it.
-    """
-
-    def __init__(self, patch_size=16, image_size=(128, 128)):
-        super().__init__()
-        self.patch_size = patch_size
-        self.image_size = image_size  # (H, W)
-
-    def forward(self, patches):
-        """
-        patches: (B, N, C, p, p)
-        return: (B, C, H, W)
-        """
-        B, N, C, p, _ = patches.shape
-        H, W = self.image_size
-
-        # Invert the shape transformations used in patchify:
-        #   currently (B, N, C, p, p) => reshape to (B, C*p*p, N)
-        patches = patches.view(B, N, C * p * p).transpose(1, 2)  # (B, C*p*p, N)
-
-        # Use fold to go back to (B, C, H, W)
-        out = F.fold(patches, output_size=(H, W), kernel_size=p, stride=p)
-        return out
-
-
-# --------------------
-# Local CNN for each patch
-# --------------------
-class LocalPatchCNN(nn.Module):
-    """
-    Example local CNN that processes each patch from (C, p, p) -> a hidden representation (64 channels).
-    You can customize kernel sizes, #channels, etc.
-    """
-
-    def __init__(self, in_channels=3, hidden_dim=64, patch_size=16):
-        super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, hidden_dim, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1)
-        self.patch_size = patch_size
-
-    def forward(self, x):
-        # x: (B, in_channels, p, p)
-        out = F.relu(self.conv1(x))
-        out = F.relu(self.conv2(out))
-        return out  # shape: (B, hidden_dim, p, p)
-
-
-# --------------------
-# Patch Encoder
-# --------------------
-class PatchEncoder(nn.Module):
-    """
-    Encodes one patch into a latent vector.
-    1) local CNN to get a feature map
-    2) adaptive pooling -> single vector
-    3) linear projection to latent_dim
-    """
-
-    def __init__(self, in_channels=3, hidden_dim=64, latent_dim=128, patch_size=16):
-        super().__init__()
-        self.local_cnn = LocalPatchCNN(in_channels, hidden_dim, patch_size)
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(hidden_dim, latent_dim)
-
-    def forward(self, x):
-        # x shape: (B, in_channels, p, p)
-        feat_map = self.local_cnn(x)  # (B, hidden_dim, p, p)
-        pooled = self.pool(feat_map)  # (B, hidden_dim, 1, 1)
-        pooled = pooled.view(pooled.size(0), -1)  # (B, hidden_dim)
-        latent = self.fc(pooled)  # (B, latent_dim)
-        return latent
-
-
-# --------------------
-# Patchify Autoencoder
-# --------------------
-class PatchifyAutoencoder(nn.Module):
-    """
-    Full autoencoder that:
-      1) Patchifies an image
-      2) Encodes each patch into a latent vector
-      3) Optionally applies a global aggregator
-      4) Decodes each patch from the latent vector
-      5) Unpatchifies to reconstruct the full image
-    """
-
-    def __init__(self,
-                 patch_size=16,
-                 image_size=(512, 512),
-                 in_channels=3,
-                 hidden_dim=64,
-                 latent_dim=128):
-        super().__init__()
-        self.patch_size = patch_size
-        self.image_size = image_size
-
-        # Modules for patchification
-        self.patchify = Patchify(patch_size)
-        self.unpatchify = Unpatchify(patch_size, image_size)
-
-        # Patch-level encoder and decoder
-        self.encoder = PatchEncoder(in_channels, hidden_dim, latent_dim, patch_size)
-
-        # A simple aggregator: linear transformation of latent vectors
-        # (could be a transformer, RNN, attention, etc. if you want to capture relations among patches)
-        # self.aggregator = nn.Linear(latent_dim, latent_dim)
-        self.aggregator = Transformer2DWrapper(in_channels=latent_dim, out_channels=latent_dim, patch_size=patch_size,
-                                               norm_type='ada_norm_single',
-                                               sample_size=(image_size[-1] // patch_size) ** 2)
-
-        # Decoder head that turns a latent vector -> local patch representation
-        # We'll decode to a hidden_dim feature map, then do a final conv to get 3 channels
-        self.decoder_fc = nn.Linear(latent_dim, hidden_dim * (patch_size // 1) * (patch_size // 1))
-        self.decoder_cnn = nn.Sequential(
-            nn.ConvTranspose2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.ConvTranspose2d(hidden_dim, in_channels, kernel_size=3, padding=1),
-        )
-
-        self.final_projection = ResidualConvLayer(3, 3)
-
-    def forward(self, x):
-        """
-        x: (B, 3, H, W)
-        returns: reconstruction of x with shape (B, 3, H, W)
-        """
-        B, C, H, W = x.shape
-
-        # -- 1) Split the image into patches
-        patches = self.patchify(x)  # shape: (B, N, C, p, p)
-        B_, N, C_, p, p_ = patches.shape
-
-        # Flatten patches into a single batch dimension for parallel encoding
-        # patches = patches.view(B_ * N, C_, p, p_)
-        patches = rearrange(patches, 'b n c p1 p2 -> (b n) c p1 p2')
-
-        # -- 2) Encode each patch into a latent vector
-        patch_latents = self.encoder(patches)  # (B*N, latent_dim)
-
-        # -- 3) Aggregate or transform latents (optional)
-        patch_latents = self.aggregator(patch_latents)  # (B*N, latent_dim)
-        patch_latents = F.relu(patch_latents)
-
-        # -- 4) Decode each patch from latent
-        #     decode into a hidden_dim × p × p feature map
-        dec_input = self.decoder_fc(patch_latents)  # shape: (B*N, hidden_dim * p * p)
-        # dec_input = dec_input.view(B * N, -1, p, p)  # reshape to (B*N, hidden_dim, p, p)
-        dec_input = rearrange(dec_input, 'BN (hidden p1 p2) -> BN hidden p1 p2', p1=p, p2=p)
-
-        #     apply final conv transpose to get 3 channels
-        reconstructed_patches = self.decoder_cnn(dec_input)  # (B*N, 3, p, p)
-
-        # -- 5) Fold the reconstructed patches back into an image
-        reconstructed_patches = reconstructed_patches.view(B_, N, C, p, p)
-        x_hat = self.unpatchify(reconstructed_patches)  # (B, 3, H, W)
-
-        x_hat = self.final_projection(x_hat)
-
-        return x + x_hat
-
 
 if __name__ == "__main__":
     parser = ArgumentParser()

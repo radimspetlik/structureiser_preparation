@@ -24,7 +24,6 @@ scipy = "*"
 imgaug = "*"
 einops = "*"
 omegaconf = "*"
-pytorch-lightning = ">=1.5.0"
 transformers = ">=4.36"
 tokenizers = ">=0.14.1"
 controlnet-aux = "==0.0.3"
@@ -40,8 +39,6 @@ accelerate="*"
 kornia="*"
 fvcore="*"
 mpld3 = "*"
-geoopt = { git = "https://github.com/geoopt/geoopt.git" }
-hypll = "*"
 
 [dev-packages]
 

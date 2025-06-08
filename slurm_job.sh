@@ -59,5 +59,5 @@ for node in ${node_list[@]}; do
       --rdzv-id=${SLURM_JOB_ID} \
       --rdzv-backend=c10d \
       --rdzv-endpoint=${MASTER_NODE}:29529 \
-      "${SCRIPT_NAME}" ${SLURM_JOB_ID} "${CONFIG_FILE}"
+      "${SCRIPT_NAME}" "${CONFIG_FILE}"
 done
