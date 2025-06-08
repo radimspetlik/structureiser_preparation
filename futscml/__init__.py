@@ -1,5 +1,4 @@
 from .futscml import *
-from .features import FeatureExtract_SqueezeNet, FeatureExtract_VGG, FeatureExtract_ResNet, FeatureExtract_HighresNet
 #from .nnfutils import grid_vote, load_torchified_nnf, nnf_upsample_linear, nnf_to_dat, torchify_nnf
 from .osutil import dir_diff
 from .datamanip import parse_img, pack_img, cut_patch, cut_patches
@@ -10,7 +9,6 @@ from .logger import TensorboardLogger
 from .datasets import RestrictedCIFAR10, ImageDirectory, DirectoryOfSubdirectories, InfiniteDatasetSampler
 from .colormap import colormap_value
 #from .style_transfer import make_extractor, gatys_style_transfer
-from .figcompare import make_comparison_figure
 #from .strotss import strotss
 #from .adversarial_attacks import fgsm_attack_targeted
 from .model_tricks import conv_swap_channels_inplace
