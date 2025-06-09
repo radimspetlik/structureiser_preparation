@@ -40,16 +40,27 @@ echo "node_list: ${node_list[@]}"
 
 MASTER_NODE="$(scontrol show hostnames "${SLURM_NODELIST}" | head -1)"
 
+SIF_PATH="${PROJECT_DIR}/singularity/${SINGULARITY_IMAGE_NAME}.sif"
 for node in ${node_list[@]}; do
-  singularity exec --nv --cleanenv \
-    -B"${SCRATCH}:${SCRATCH}" \
-    -B"${PROJECT_DIR}:${PROJECT_DIR}" \
-    "${PROJECT_DIR}/singularity/${SINGULARITY_IMAGE_NAME}.sif" \
-    torchrun \
+  if [ -f "${SIF_PATH}" ]; then
+    singularity exec --nv --cleanenv \
+      -B"${SCRATCH}:${SCRATCH}" \
+      -B"${PROJECT_DIR}:${PROJECT_DIR}" \
+      "${SIF_PATH}" \
+      torchrun \
+        --nnodes=${NNODES} \
+        --nproc-per-node=${GPUS_PER_NODE} \
+        --rdzv-id=${SLURM_JOB_ID} \
+        --rdzv-backend=c10d \
+        --rdzv-endpoint=${MASTER_NODE}:29529 \
+        ${ARGS}
+  else
+    pipenv run torchrun \
       --nnodes=${NNODES} \
       --nproc-per-node=${GPUS_PER_NODE} \
       --rdzv-id=${SLURM_JOB_ID} \
       --rdzv-backend=c10d \
       --rdzv-endpoint=${MASTER_NODE}:29529 \
       ${ARGS}
+  fi
 done
