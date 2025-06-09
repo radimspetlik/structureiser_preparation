@@ -30,8 +30,7 @@ class TensorboardLogger():
         #     self.summary_writer.close()
 
     def experiment_name(self):
-        # return self.created_at.strftime('%Y-%m-%d_%H-%M-%S') + self.suffix
-        return self.suffix
+        return self.created_at.strftime('%Y-%m-%d_%H-%M-%S') + self.suffix
 
     def location(self):
         return os.path.join(self.output_path, self.experiment_name())

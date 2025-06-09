@@ -1,6 +1,6 @@
-key_frames_dir: data/Lynx/style/
-frames_dir: data/Lynx/sequence/
-logdir: data/Lynx/logs/
+key_frames_dir: data/Lili/style_pix2video/
+frames_dir: data/Lili/sequence/
+logdir: data/Lili/logs/
 
 iters: 10000
 max_time_minutes: null
@@ -30,7 +30,5 @@ model_params:
   norm_layer: 'instance_norm'
   use_bias: true
   tanh: true
-  filters: [32, 64, 128, 128, 64, 32]
-  cross_attention_dim: 128
-  resnet_blocks: 1
-  use_attention: false
+  filters: [64, 128, 128, 128, 128, 64]
+  resnet_blocks: 9

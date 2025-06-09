@@ -1,27 +1,20 @@
 #!/bin/bash
 
-cd "${HOME}/structureiser" || exit
+source "./config.sh"
 
-# if env variable SLURM_JOB_ID is not defined, then define it
+cd "${SCRIPT_DIR}" || exit
+
 if [ -z "${SLURM_JOB_ID}" ]; then
   SLURM_JOB_ID="0000000"
 fi
 
-# if number of arguments is zero, echo "zero"
 if [ $# -eq 0 ]; then
   SCRIPT_NAME="structureiser.py"
   CONFIG_FILE="confs/lynx.yml"
+  ARGS="${SCRIPT_NAME} ${CONFIG_FILE}"
 else
-  SCRIPT_NAME="${2}"
-  CONFIG_FILE="${1}"
+  ARGS="${@}"
 fi
-
-SINGULARITY_IMAGE_NAME="structureiser"
-
-PROJECT_DIR="/mnt/data/vrg/spetlrad/data"
-SCRATCH="/data/temporary/"
-
-echo "PROJECT_DIR: ${PROJECT_DIR}"
 
 if [ -z "${SLURM_JOB_ID}" ]; then
   NNODES=1
@@ -47,7 +40,6 @@ echo "node_list: ${node_list[@]}"
 
 MASTER_NODE="$(scontrol show hostnames "${SLURM_NODELIST}" | head -1)"
 
-
 for node in ${node_list[@]}; do
   singularity exec --nv --cleanenv \
     -B"${SCRATCH}:${SCRATCH}" \
@@ -59,5 +51,5 @@ for node in ${node_list[@]}; do
       --rdzv-id=${SLURM_JOB_ID} \
       --rdzv-backend=c10d \
       --rdzv-endpoint=${MASTER_NODE}:29529 \
-      "${SCRIPT_NAME}" "${CONFIG_FILE}"
+      ${ARGS}
 done
