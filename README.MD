@@ -1,0 +1,74 @@
+# StructuReiser: A Structure-preserving Video Stylization Method
+
+This repository accompanies the paper accepted to **COMPUTER GRAPHICS Forum** (Vol. 44, 2025, No. 4) by Radim Spetlik, David Futschik, and Daniel Sykora.
+
+![Teaser](img/teaser.png)
+
+## Abstract
+
+We introduce StructuReiser, a novel video-to-video translation method that transforms input videos into stylized sequences using a set of user-provided keyframes. Unlike most existing methods, StructuReiser strictly adheres to the structural elements of the target video, preserving the original identity while seamlessly applying the desired stylistic transformations. This provides a level of control and consistency that is challenging to achieve with text-driven or keyframe-based approaches, including large video models. Furthermore, StructuReiser supports real-time inference on standard graphics hardware as well as custom keyframe editing, enabling interactive applications and expanding possibilities for creative expression and video manipulation.
+
+## Features
+
+- **Structure preservation** – maintains the original content while applying style.
+- **Keyframe driven** – stylize a sequence based on a few example frames.
+- **Real-time inference** – runs interactively on commodity GPUs.
+- **Editable** – modify keyframes to steer the style in specific regions.
+
+## Installation
+
+This repository uses `pipenv` for dependency management. Install the required packages with:
+
+```bash
+pipenv install --dev
+```
+
+### Singularity environment
+If you run on a cluster with Singularity, build the container with:
+
+```bash
+bash singularity_build.sh
+```
+
+The resulting image will reside in `${PROJECT_DIR}/singularity/structureiser.sif`. The `slurm_job.sh` script detects this file automatically. When present it launches the job inside the container; otherwise it falls back to running the command inside your local `pipenv` environment.
+
+
+## Training
+
+Edit the configuration in `confs/lili.yml` and launch training:
+
+```bash
+bash train.sh
+```
+
+Training runs through the provided `slurm_job.sh` wrapper for multi-GPU setups.
+
+## Inference
+
+Place your input frames in `${INPUT_DIR}` as specified in `config.sh` and run:
+
+```bash
+bash evaluate.sh
+```
+
+The stylized frames will appear in `${OUTPUT_DIR}`.
+
+### Provided sequence and checkpoint
+This repository ships with the sample sequence and trained model for **Lili**, as shown in the paper. Both can be found under `data/Lili/` and are ready for evaluation.
+
+
+## Citation
+
+If you use StructuReiser in your work, please cite our paper:
+
+```bibtex
+@article{spetlik2025structurereiser,
+  title={StructuReiser: A Structure-preserving Video Stylization Method},
+  author={Spetlik, Radim and Futschik, David and Sykora, Daniel},
+  journal={Computer Graphics Forum},
+  volume={44},
+  number={4},
+  year={2025},
+}
+```
+
