@@ -2,24 +2,48 @@
 
 source "./config.sh"
 
-cd "${SCRIPT_DIR}" || exit
+run_torch() {
+  local sif_path="${PROJECT_DIR}/singularity/${SINGULARITY_IMAGE_NAME}.sif"
 
-if [ -z "${SLURM_JOB_ID}" ]; then
-  SLURM_JOB_ID="0000000"
-fi
+  if [ -f "${sif_path}" ]; then
+    singularity exec --nv --cleanenv \
+      -B "${SCRATCH}:${SCRATCH}" \
+      -B "${PROJECT_DIR}:${PROJECT_DIR}" \
+      "${sif_path}" \
+      torchrun \
+        --nnodes="${NNODES}" \
+        --nproc-per-node="${GPUS_PER_NODE}" \
+        --rdzv-id="${SLURM_JOB_ID}" \
+        --rdzv-backend=c10d \
+        --rdzv-endpoint="${MASTER_NODE}:29529" \
+        ${ARGS}
+  else
+    pipenv run torchrun \
+      --nnodes="${NNODES}" \
+      --nproc-per-node="${GPUS_PER_NODE}" \
+      --rdzv-id="${SLURM_JOB_ID}" \
+      --rdzv-backend=c10d \
+      --rdzv-endpoint="${MASTER_NODE}:29529" \
+      ${ARGS}
+  fi
+}
+
+cd "${SCRIPT_DIR}" || exit
 
 if [ $# -eq 0 ]; then
   SCRIPT_NAME="structureiser.py"
-  CONFIG_FILE="confs/lynx.yml"
+  CONFIG_FILE="confs/lili.yml"
   ARGS="${SCRIPT_NAME} ${CONFIG_FILE}"
 else
   ARGS="${@}"
 fi
 
 if [ -z "${SLURM_JOB_ID}" ]; then
-  NNODES=1
-  GPUS_PER_NODE=1
+  echo "Running interactively without SLURM"
+  run_torch
+  exit 0
 else
+  echo "Running in SLURM job ${SLURM_JOB_ID}"
   NNODES=${SLURM_NNODES}
   GPUS_PER_NODE=$(scontrol show job ${SLURM_JOB_ID} | grep -oP 'gres/gpu:\K[^ ]+')
 fi
@@ -40,27 +64,7 @@ echo "node_list: ${node_list[@]}"
 
 MASTER_NODE="$(scontrol show hostnames "${SLURM_NODELIST}" | head -1)"
 
-SIF_PATH="${PROJECT_DIR}/singularity/${SINGULARITY_IMAGE_NAME}.sif"
 for node in ${node_list[@]}; do
-  if [ -f "${SIF_PATH}" ]; then
-    singularity exec --nv --cleanenv \
-      -B"${SCRATCH}:${SCRATCH}" \
-      -B"${PROJECT_DIR}:${PROJECT_DIR}" \
-      "${SIF_PATH}" \
-      torchrun \
-        --nnodes=${NNODES} \
-        --nproc-per-node=${GPUS_PER_NODE} \
-        --rdzv-id=${SLURM_JOB_ID} \
-        --rdzv-backend=c10d \
-        --rdzv-endpoint=${MASTER_NODE}:29529 \
-        ${ARGS}
-  else
-    pipenv run torchrun \
-      --nnodes=${NNODES} \
-      --nproc-per-node=${GPUS_PER_NODE} \
-      --rdzv-id=${SLURM_JOB_ID} \
-      --rdzv-backend=c10d \
-      --rdzv-endpoint=${MASTER_NODE}:29529 \
-      ${ARGS}
-  fi
+    echo "==> Launching on node: ${node}"
+    run_torch
 done

@@ -3,7 +3,6 @@ import os
 from contextlib import suppress as suppress
 from argparse import ArgumentParser
 
-import yaml
 import torch
 import torch as th
 import torch.nn as nn
@@ -12,7 +11,6 @@ import torch.nn.functional as F
 import torchvision.models as models
 import torchvision.io
 import numpy as np
-import cv2
 from torch.utils.data import DataLoader, Dataset
 from torchvision.transforms import functional as Tfunc
 from torchvision.models import VGG19_Weights, VGG19_BN_Weights
@@ -239,6 +237,8 @@ class InnerProductLoss(nn.Module):
         loss = torch.empty((len(feat_frame_y),)).to(frame_y.device)
         for l in range(len(feat_frame_y)):
             gmm_frame_y = self.gmm(feat_frame_y[l])
+            if config.use_patches:
+                gmm_frame_y = repeat(gmm_frame_y, '1 h w -> c h w', c=gmm_pure_y[l].shape[0])
             assert gmm_pure_y[l].shape[0] == gmm_frame_y.shape[0]
             assert not (gmm_pure_y[l].requires_grad)
             dist = self.dist(gmm_pure_y[l].detach(), gmm_frame_y)
@@ -399,9 +399,6 @@ def log_verification_video(config, log, step, label, model, dataset, transform, 
             if max_frames is not None and i >= max_frames: break
             if len(b.shape) == 3: b = b.unsqueeze(0)
             b = tensor_resample(b.to(device), [shape[2], shape[3]])
-            if config['model_params']['input_channels'] == 4:
-                ones = th.ones_like(b[:, :1], device=device)
-                b = th.cat([ones, b], dim=1)
             frame = model(b)
             for j in range(frame.shape[0]):
                 vid_tensor[:, i, :, :, :] = transform.denormalize_tensor(frame[j:j + 1])
@@ -448,22 +445,70 @@ class ControlProcessor:
         return control_image_0_1
 
 
-def cut_patches(images):
-    patch_size = config.patch_size
 
-    y = np.random.randint(0, patch_size)
-    x = np.random.randint(0, patch_size)
+class PatchSampler:
+    def __init__(self, patch_size: int, num_patches: int):
+        """
+        Args:
+            patch_size: size of the square patch (k)
+            num_patches: how many patches to return per call
+        """
+        self.ps = patch_size
+        self.num_patches = num_patches
 
-    images = [image[..., y:-(patch_size - y), x:-(patch_size - x)] for image in images]
+        # Will be set when we first see an image:
+        self._positions = None  # Tensor of shape (total_positions, 2)
+        self._ptr = 0
 
-    images = [th.nn.functional.unfold(image, kernel_size=patch_size, stride=patch_size) for image in images]
-    images = [rearrange(image, 'b (c k1 k2) n -> (b n) c k1 k2', k1=patch_size, k2=patch_size) for image in images]
+    def _init_perm(self, img: torch.Tensor):
+        """
+        Given one image tensor of shape (B, C, H, W),
+        build & shuffle all valid (y,x) top-left patch coords.
+        """
+        _, _, H, W = img.shape
+        # all valid y and x such that y + ps <= H, x + ps <= W
+        ys = torch.arange(0, H - self.ps + 1, device=img.device)
+        xs = torch.arange(0, W - self.ps + 1, device=img.device)
+        Y, X = torch.meshgrid(ys, xs, indexing='ij')          # both shapes (H-ps+1, W-ps+1)
+        coords = torch.stack([Y.flatten(), X.flatten()], dim=1)  # (N, 2)
+        N = coords.shape[0]
 
-    num_indices = config.num_patches
-    image_random_indices = th.randint(0, images[0].shape[0], (num_indices,))
-    images = [image[image_random_indices] for image in images]
+        # shuffle once
+        perm = torch.randperm(N, device=img.device)
+        self._positions = coords[perm]  # (N, 2), now a random order
+        self._ptr = 0
 
-    return images
+    def cut_patches(self, images: list[torch.Tensor]) -> list[torch.Tensor]:
+        """
+        Args:
+            images: list of tensors, each of shape (B, C, H, W)
+        Returns:
+            list of tensors of patches; each tensor has shape (B * num_patches, C, ps, ps)
+        """
+        # (re-)initialize if first call or running out of positions
+        if (self._positions is None
+            or self._ptr + self.num_patches > self._positions.size(0)):
+            self._init_perm(images[0])
+
+        # grab next slice of coords
+        coords = self._positions[self._ptr : self._ptr + self.num_patches]
+        self._ptr += self.num_patches
+
+        outputs = []
+        for img in images:
+            # for each (y,x), slice out img[..., y:y+ps, x:x+ps]
+            # stack them along a new axis=2 → (B, C, num_patches, ps, ps)
+            stacked = torch.stack([
+                img[..., y : y + self.ps, x : x + self.ps]
+                for (y, x) in coords
+            ], dim=2)
+
+            # flatten batch & patch dims → (B * num_patches, C, ps, ps)
+            patches = rearrange(stacked, 'b c n k1 k2 -> (b n) c k1 k2')
+
+            outputs.append(patches)
+
+        return outputs
 
 
 import bisect
@@ -516,8 +561,8 @@ def closest_value(d: Dict[int, V], x: int, width: int) -> Optional[V]:
     return target_key
 
 
-def train_with_similarity(config, model, iters, key_weight, style_weight, structure_weight, dataset_train, dataset_aux,
-                          dataset_val, transform, device, log):
+def train(config, model, iters, key_weight, style_weight, structure_weight, dataset_train, dataset_aux,
+          dataset_val, transform, device, log):
     model.to(device)
 
     if key_weight > 0.:
@@ -569,11 +614,15 @@ def train_with_similarity(config, model, iters, key_weight, style_weight, struct
 
                 frame_x = frame_x.to(device)
 
+                pure_y_full = pure_y.clone()
+                if config.use_patches:
+                    keyframe_x, keyframe_y, pure_x, pure_y = \
+                        sampler.cut_patches([keyframe_x, keyframe_y, pure_x, pure_y])
+
                 optimizer.zero_grad()
 
                 with suppress():
-                    keyframe_x_ = keyframe_x.clone()
-                    y = model(keyframe_x_)
+                    y = model(keyframe_x.clone())
 
                 # L1 Loss Calculation
                 key_loss += key_weight * image_loss(y, keyframe_y)
@@ -582,7 +631,7 @@ def train_with_similarity(config, model, iters, key_weight, style_weight, struct
                     frame_y = model(frame_x.clone())
 
                 with suppress():
-                    style_loss = style_weight * similarity_loss(frame_y, pure_y, cache_y2=True)
+                    style_loss = style_weight * similarity_loss(frame_y, pure_y_full, cache_y2=True)
                     structure_loss = structure_weight * guidance_sd.train_step(frame_y / 2.0 + 0.5,
                                                                                control_image_0_1,
                                                                                epoch=epoch,
@@ -628,8 +677,8 @@ def train_with_similarity(config, model, iters, key_weight, style_weight, struct
             if epoch % log_video_update_every == 0 and epoch != 0:
                 if dataset_val is not None:
                     log_verification_video(config, log, epoch, 'Validation Frames', model, dataset_val, transform,
-                                           y.shape, max_frames=500, fps=25)
-                log_verification_video(config, log, epoch, 'Auxiliary Frames', model, dataset_aux, transform, y.shape,
+                                           frame_x.shape, max_frames=500, fps=25)
+                log_verification_video(config, log, epoch, 'Auxiliary Frames', model, dataset_aux, transform, frame_x.shape,
                                        max_frames=None)
                 log.flush()
                 log.log_checkpoint({'state_dict': model.state_dict(), 'opt_dict': optimizer.state_dict()}, 'latest')
@@ -784,11 +833,13 @@ if __name__ == "__main__":
 
     layers = config['vgg_layers']
 
+    sampler = PatchSampler(config.patch_size, config.num_patches)
+
     similarity_loss = InnerProductLoss(layers, device)
 
     guidance_sd, processor = prepare_cldm(config)
 
-    train_with_similarity(config, model, config['iters'], key_weight, style_weight, structure_weight,
-                          trainset, auxset, testset,
-                          transform, device, log)
+    train(config, model, config['iters'], key_weight, style_weight, structure_weight,
+          trainset, auxset, testset,
+          transform, device, log)
 
